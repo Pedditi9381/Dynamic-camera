@@ -2668,6 +2668,7 @@ function updateAnimationDuration() {
         : activeAnim ? `Model animation selected: ${activeAnim}.` : "Model ready.");
       renderTimelineMarkers();
       seek(0);
+      if (!state.keyframes.length) fitModel();
     } else {
       attempts++;
       requestAnimationFrame(check);
@@ -2979,6 +2980,7 @@ async function handleFile(file) {
       const likelyLabels = isLikelyLabelJson(json);
       const cameraFrames = likelyLabels ? [] : extractCameraFrames(json);
       if (cameraFrames.length) {
+        state.fps = 24;
         if (json.shakeEnabled !== undefined) {
           state.shakeEnabled = !!json.shakeEnabled;
           inputs.shakeEnabled.checked = state.shakeEnabled;
@@ -3072,15 +3074,13 @@ function fitModel() {
 
 function resetCamera() {
   state.keyframes = [];
-  state.duration = parseNumber(inputs.duration.value, 6);
-  
-  // Fit model to screen to establish optimal framing defaults
-  fitModel();
-  
+  state.duration = Math.max(parseNumber(inputs.duration.value, 6), state.modelAnimationDuration, 0.2);
+  inputs.duration.value = state.duration.toFixed(1);
+  stop();
   renderKeyframes();
   renderTimelineMarkers();
   drawCameraPath();
-  stop();
+  fitModel();
 }
 
 inputs.project.addEventListener("change", () => inputs.project.files[0] && loadWorkingFile(inputs.project.files[0]).catch((error) => setStatus(error.message, "warn")));
@@ -3602,6 +3602,17 @@ modelViewer.addEventListener("contextmenu", (event) => {
     event.preventDefault();
   }
 });
+
+modelViewer.addEventListener("click", (event) => {
+  if (!event.target.closest(".hotspot")) {
+    event.stopImmediatePropagation();
+  }
+}, true);
+
+modelViewer.addEventListener("dblclick", (event) => {
+  event.stopImmediatePropagation();
+  event.preventDefault();
+}, true);
 
 modelViewer.addEventListener("pointerdown", (event) => {
   if (event.ctrlKey && event.button === 2) {
