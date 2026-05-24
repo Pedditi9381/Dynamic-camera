@@ -153,6 +153,7 @@
           interaction-prompt="none"
           exposure="1"
           shadow-intensity="0.75"
+          disable-tap
           min-camera-orbit="auto auto 0m"
           max-camera-orbit="auto auto Infinity"
           ar
@@ -316,6 +317,16 @@
               <span>Generate</span>
             </button>
           </div>
+          <div class="field-grid" style="margin-top: 6px; margin-bottom: 6px;">
+            <label>
+              <span>Start Frame</span>
+              <input id="aiStartFrameInput" type="number" min="0" placeholder="Current" />
+            </label>
+            <label>
+              <span>End Frame (Optional)</span>
+              <input id="aiEndFrameInput" type="number" min="0" placeholder="Auto" />
+            </label>
+          </div>
           <div class="ai-example-chips" aria-label="Example prompts">
             <button class="ai-chip" type="button" data-prompt="slow cinematic push-in 5s">Cinematic Push</button>
             <button class="ai-chip" type="button" data-prompt="360 degree orbit sweep 6s">360 Orbit</button>
@@ -353,6 +364,14 @@
           <label class="checkbox-control">
             <input id="shakeEnabledInput" type="checkbox" />
             <span>Handheld Camera Shake</span>
+          </label>
+          <label class="file-control">
+            <span>Shake Profile</span>
+            <select id="shakeProfileSelect" disabled>
+              <option value="continuous">Continuous Handheld</option>
+              <option value="impact">Impact / Ground Drop</option>
+              <option value="rumble">Erratic Rumbling / Storm</option>
+            </select>
           </label>
           <label class="range-control">
             <span>

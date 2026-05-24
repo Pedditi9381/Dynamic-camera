@@ -59,9 +59,12 @@ const inputs = {
   shakeEnabled: document.querySelector("#shakeEnabledInput"),
   shakeIntensity: document.querySelector("#shakeIntensityInput"),
   shakeSpeed: document.querySelector("#shakeSpeedInput"),
+  shakeProfile: document.querySelector("#shakeProfileSelect"),
   presetSelect: document.querySelector("#presetSelect"),
   easingSelect: document.querySelector("#easingSelect"),
   aiPrompt: document.querySelector("#aiPromptInput"),
+  aiStartFrame: document.querySelector("#aiStartFrameInput"),
+  aiEndFrame: document.querySelector("#aiEndFrameInput"),
 };
 
 const buttons = {
@@ -193,6 +196,7 @@ const state = {
   shakeEnabled: false,
   shakeIntensity: 0.3,
   shakeSpeed: 2.0,
+  shakeProfile: "continuous",
   presets: [...CAMERA_PRESETS],
   selectedPresetIndex: -1,
   timelineViewStartFrame: 0,
@@ -426,17 +430,33 @@ function setKeyframes(rawFrames, duration) {
 
   state.keyframes = frames;
   
+  const lastKeyframeTime = state.keyframes.at(-1)?.time || 0.2;
+  
   if (duration !== undefined && duration !== null) {
     const durationValue = parseNumber(duration, 6);
-    state.duration = Math.max(durationValue > 60 ? durationValue / state.fps : durationValue, 0.2);
+    const calculatedDuration = durationValue > 60 ? durationValue / state.fps : durationValue;
+    state.duration = Math.max(
+      calculatedDuration,
+      lastKeyframeTime,
+      state.modelAnimationDuration,
+      0.2
+    );
   } else {
     state.duration = Math.max(
       parseNumber(inputs.duration.value, 6),
-      state.keyframes.at(-1)?.time || 0.2,
+      lastKeyframeTime,
+      state.modelAnimationDuration,
       0.2,
     );
   }
   inputs.duration.value = state.duration.toFixed(1);
+  
+  // Reset timeline view bounds to show all keyframes
+  state.timelineViewStartFrame = 0;
+  state.timelineViewEndFrame = 0;
+  prevTotalFrames = 0;
+  ensureTimelineView();
+
   renderKeyframes();
   renderTimelineMarkers();
   seek(0);
@@ -567,12 +587,26 @@ function applyCamera(frame) {
   let targetY = frame.target.y;
 
   if (state.shakeEnabled) {
-    const elapsed = getTimelineTime() * state.shakeSpeed;
+    const elapsed = getTimelineTime();
     const intensity = frame.shake ?? state.shakeIntensity;
-    const yawNoise = Math.sin(elapsed * 2.3) * Math.cos(elapsed * 0.7) * intensity * 3.0;
-    const pitchNoise = Math.cos(elapsed * 1.9) * Math.sin(elapsed * 1.1) * intensity * 1.8;
-    const targetNoiseX = Math.sin(elapsed * 1.3) * Math.cos(elapsed * 2.9) * intensity * 0.06;
-    const targetNoiseY = Math.cos(elapsed * 2.7) * Math.sin(elapsed * 1.7) * intensity * 0.06;
+    let factor = 1.0;
+    
+    if (state.shakeProfile === 'impact') {
+      // Rapid decay: intensity decays to 0 over 2.0s
+      factor = Math.exp(-elapsed * 3.0);
+    } else if (state.shakeProfile === 'rumble') {
+      // Rumbling has high frequency erratic shakes
+      const noise = Math.sin(elapsed * 14.0) * Math.cos(elapsed * 8.2);
+      factor = 0.4 + 0.6 * Math.abs(noise); 
+    }
+    
+    const speed = state.shakeSpeed;
+    const t = elapsed * speed;
+
+    const yawNoise = Math.sin(t * 2.3) * Math.cos(t * 0.7) * intensity * 4.5 * factor;
+    const pitchNoise = Math.cos(t * 1.9) * Math.sin(t * 1.1) * intensity * 3.0 * factor;
+    const targetNoiseX = Math.sin(t * 1.3) * Math.cos(t * 2.9) * intensity * 0.12 * factor;
+    const targetNoiseY = Math.cos(t * 2.7) * Math.sin(t * 1.7) * intensity * 0.12 * factor;
 
     yaw += yawNoise;
     pitch += pitchNoise;
@@ -628,13 +662,58 @@ function generateAiSequence(promptText) {
     });
   };
 
-  // 1. Duration Parsing (e.g. 5s, 5 seconds)
-  let duration = state.modelAnimationDuration || state.duration || 6; // default to whole glb animation or current duration
-  const durationMatch = query.match(/(\d+(?:\.\d+)?)\s*(?:s|second|seconds)/);
-  if (durationMatch) {
-    duration = Math.max(parseFloat(durationMatch[1]), 0.5);
+  // 1. Frame Range Parsing. AI Director always starts at the current playhead.
+  let startFrame = getCurrentFrame(getTimelineTime());
+  let endFrame = inputs.aiEndFrame && inputs.aiEndFrame.value ? parseInt(inputs.aiEndFrame.value, 10) : null;
+
+  // Parse only the end frame from prompt ranges; the start is always the timeline slider frame.
+  const rangeMatch = query.match(/(?:frame\s+)?(\d+)\s*(?:to|-)\s*(?:frame\s+)?(\d+)/i);
+  if (rangeMatch) {
+    endFrame = parseInt(rangeMatch[2], 10);
   }
-  
+
+  // Parse duration from prompt (e.g. "5s", "5 seconds", "2.5s")
+  let parsedDuration = null;
+  const durationMatch = query.match(/(\d+(?:\.\d+)?)\s*(?:s|seconds?)\b/i);
+  if (durationMatch) {
+    parsedDuration = parseFloat(durationMatch[1]);
+  }
+
+  // Parse duration in frames from prompt (e.g. "30 frames", "48f")
+  let parsedFrames = null;
+  const framesMatch = query.match(/(\d+)\s*(?:frames?|f)\b/i);
+  if (framesMatch) {
+    parsedFrames = parseInt(framesMatch[1], 10);
+  }
+
+  // Calculate timeline times
+  const startTime = startFrame / state.fps;
+  let sequenceDuration = 3.0; // default fallback duration in seconds
+
+  if (endFrame !== null) {
+    sequenceDuration = Math.max((endFrame - startFrame) / state.fps, 0.1);
+  } else if (parsedDuration !== null) {
+    sequenceDuration = parsedDuration;
+    endFrame = startFrame + Math.round(sequenceDuration * state.fps);
+  } else if (parsedFrames !== null) {
+    sequenceDuration = parsedFrames / state.fps;
+    endFrame = startFrame + parsedFrames;
+  } else {
+    // If neither is specified, default to 3s, but clamp so it doesn't exceed current duration unless we are at the end
+    const remainingTime = state.duration - startTime;
+    sequenceDuration = remainingTime > 0.5 ? Math.min(3.0, remainingTime) : 3.0;
+    endFrame = startFrame + Math.round(sequenceDuration * state.fps);
+  }
+  const endTime = startTime + sequenceDuration;
+
+  // Synchronize UI inputs to match the resolved range
+  if (inputs.aiStartFrame) {
+    inputs.aiStartFrame.value = startFrame;
+  }
+  if (inputs.aiEndFrame) {
+    inputs.aiEndFrame.value = endFrame;
+  }
+
   // 2. Speed / Easing Parsing
   let speed = "easeInOut"; // default
   if (hasKeyword(["linear", "constant"])) {
@@ -663,16 +742,29 @@ function generateAiSequence(promptText) {
   let parsedShake = state.shakeEnabled;
   let parsedShakeIntensity = state.shakeIntensity;
   let parsedShakeSpeed = state.shakeSpeed;
+  let parsedProfile = state.shakeProfile || "continuous";
 
-  if (hasKeyword(["shake", "shaky", "handheld", "jitter", "unsteady", "action"])) {
+  if (hasKeyword(["shake", "shaky", "handheld", "jitter", "unsteady", "action", "drop", "impact", "stone", "crash", "explosion", "hit", "fall", "heavy stone", "dropped", "thunderstorm", "thunder", "storm", "earthquake", "rumble", "lightning"])) {
     parsedShake = true;
-    if (hasKeyword(["heavy", "extreme", "intense", "strong", "vigorous"])) {
+    
+    if (hasKeyword(["drop", "impact", "stone", "crash", "explosion", "hit", "fall", "heavy stone", "dropped"])) {
+      parsedProfile = "impact";
+      parsedShakeIntensity = 0.85;
+      parsedShakeSpeed = 4.5;
+    } else if (hasKeyword(["thunderstorm", "thunder", "storm", "earthquake", "rumble", "lightning"])) {
+      parsedProfile = "rumble";
+      parsedShakeIntensity = 0.70;
+      parsedShakeSpeed = 4.0;
+    } else if (hasKeyword(["heavy", "extreme", "intense", "strong", "vigorous"])) {
+      parsedProfile = "continuous";
       parsedShakeIntensity = 0.8;
       parsedShakeSpeed = 3.5;
     } else if (hasKeyword(["subtle", "light", "slow", "soft", "mild"])) {
+      parsedProfile = "continuous";
       parsedShakeIntensity = 0.15;
       parsedShakeSpeed = 1.2;
     } else {
+      parsedProfile = "continuous";
       parsedShakeIntensity = 0.35;
       parsedShakeSpeed = 2.0;
     }
@@ -684,9 +776,14 @@ function generateAiSequence(promptText) {
   state.shakeEnabled = parsedShake;
   state.shakeIntensity = parsedShakeIntensity;
   state.shakeSpeed = parsedShakeSpeed;
+  state.shakeProfile = parsedProfile;
 
   if (inputs.shakeEnabled) {
     inputs.shakeEnabled.checked = parsedShake;
+  }
+  if (inputs.shakeProfile) {
+    inputs.shakeProfile.value = parsedProfile;
+    inputs.shakeProfile.disabled = !parsedShake;
   }
   if (inputs.shakeIntensity) {
     inputs.shakeIntensity.value = parsedShakeIntensity.toFixed(2);
@@ -757,7 +854,7 @@ function generateAiSequence(promptText) {
     const count = is360 ? 4 : 2;
     for (let i = 0; i <= count; i++) {
       const ratio = i / count;
-      const t = ratio * duration;
+      const t = startTime + ratio * sequenceDuration;
       const yaw = directionYaw + ratio * spanYaw;
       const pitch = directionPitch;
       const radius = startRadius * (hasKeyword("closer") ? 0.8 : 1.0);
@@ -776,7 +873,7 @@ function generateAiSequence(promptText) {
     const factor = hasKeyword(["tight", "close"]) ? 0.4 : 0.65;
     generatedFrames = [
       {
-        time: 0,
+        time: startTime,
         orbit: { yaw: directionYaw, pitch: directionPitch, radius: startRadius * 1.5 },
         target: { ...currentTarget },
         lens,
@@ -785,7 +882,7 @@ function generateAiSequence(promptText) {
         easing: speed
       },
       {
-        time: duration,
+        time: endTime,
         orbit: { yaw: directionYaw, pitch: directionPitch, radius: startRadius * factor },
         target: { ...currentTarget },
         lens,
@@ -798,7 +895,7 @@ function generateAiSequence(promptText) {
     const factor = hasKeyword(["far", "wide"]) ? 1.8 : 1.4;
     generatedFrames = [
       {
-        time: 0,
+        time: startTime,
         orbit: { yaw: directionYaw, pitch: directionPitch, radius: startRadius * 0.7 },
         target: { ...currentTarget },
         lens,
@@ -807,7 +904,7 @@ function generateAiSequence(promptText) {
         easing: speed
       },
       {
-        time: duration,
+        time: endTime,
         orbit: { yaw: directionYaw, pitch: directionPitch, radius: startRadius * factor },
         target: { ...currentTarget },
         lens,
@@ -821,7 +918,7 @@ function generateAiSequence(promptText) {
     const endYawOffset = hasKeyword(["reveal", "sweep"]) ? 45 : 0;
     generatedFrames = [
       {
-        time: 0,
+        time: startTime,
         orbit: { yaw: directionYaw - endYawOffset, pitch: directionPitch, radius: startRadius * 1.2 },
         target: { ...currentTarget },
         lens,
@@ -830,7 +927,7 @@ function generateAiSequence(promptText) {
         easing: speed
       },
       {
-        time: duration,
+        time: endTime,
         orbit: { yaw: directionYaw + endYawOffset, pitch: directionPitch - 10, radius: startRadius },
         target: { ...currentTarget },
         lens,
@@ -841,23 +938,34 @@ function generateAiSequence(promptText) {
     ];
   }
 
-  // Keep the timeline duration at the maximum of its current length, audio length, model animation length, and the new generated sequence length
-  const targetDuration = Math.max(
-    state.duration,
-    duration,
-    state.modelAnimationDuration || 0,
-    state.audioDuration || 0
+  // Normalize generated frames
+  const normalizedGenerated = generatedFrames.map((frame, index) => 
+    normalizeKeyframe(frame, index, generatedFrames.length)
   );
-  state.duration = targetDuration;
-  inputs.duration.value = targetDuration.toFixed(1);
-  setKeyframes(generatedFrames, targetDuration);
-  seek(0);
+
+  // Filter out any existing keyframes that fall inside the new target range
+  state.keyframes = state.keyframes.filter(frame => 
+    frame.time < startTime - 0.001 || frame.time > endTime + 0.001
+  );
+
+  // Append new keyframes and sort
+  state.keyframes = [...state.keyframes, ...normalizedGenerated].sort((a, b) => a.time - b.time);
+
+  // Adjust total duration if new sequence extends past it
+  if (endTime > state.duration) {
+    state.duration = endTime;
+    inputs.duration.value = endTime.toFixed(1);
+  }
+
+  renderKeyframes();
+  renderTimelineMarkers();
+  seek(startTime);
   drawCameraPath();
 
   // Automatically play the generated sequence
   play();
 
-  setStatus(`AI Director: Generated ${generatedFrames.length} keyframes over ${duration}s using '${speed}' easing.`);
+  setStatus(`AI Director: Merged keyframes from frame ${startFrame} to ${getCurrentFrame(endTime)}.`);
 }
 
 function getEasingValue(type, t) {
@@ -1043,21 +1151,55 @@ function getTimelineFrameDuration() {
 }
 
 function getModelAnimationDuration() {
-  if (!modelViewer || !modelViewer.animations || !modelViewer.animationName) return 0;
-  const clip = Array.from(modelViewer.animations).find(a => a.name === modelViewer.animationName);
-  return clip ? parseNumber(clip.duration, 0) : 0;
+  if (!modelViewer) return 0;
+  const durations = [];
+  
+  // 1. Try reading direct duration property
+  let duration = parseNumber(modelViewer.duration, 0);
+  if (duration > 0) durations.push(duration);
+  
+  // 2. Try reading every Three.js clip, then use the longest clip for total timeline frames.
+  try {
+    const model = modelViewer.model;
+    if (model && model.animations) {
+      Array.from(model.animations).forEach((clip) => {
+        const clipDuration = parseNumber(clip.duration, 0);
+        if (clipDuration > 0) durations.push(clipDuration);
+      });
+    }
+  } catch (e) {
+    console.warn("Could not read duration from modelViewer.model.animations:", e);
+  }
+
+  // 3. Try reading from the internal three3d object animations if available
+  try {
+    const symbol = Symbol.for('three3d');
+    const three = modelViewer[symbol];
+    if (three && three.animations) {
+      Array.from(three.animations).forEach((clip) => {
+        const clipDuration = parseNumber(clip.duration, 0);
+        if (clipDuration > 0) durations.push(clipDuration);
+      });
+    }
+  } catch (e) {
+    console.warn("Could not read duration from three3d symbol:", e);
+  }
+  
+  return durations.length ? Math.max(...durations) : 0;
 }
 
 function getTotalFrames() {
   return Math.max(1, Math.round(getTimelineFrameDuration() * state.fps));
 }
 
+let prevTotalFrames = 0;
 function ensureTimelineView() {
   const totalFrames = getTotalFrames();
-  state.timelineViewStartFrame = clamp(state.timelineViewStartFrame, 0, Math.max(totalFrames - 1, 0));
-  if (!state.timelineViewEndFrame || state.timelineViewEndFrame > totalFrames) {
+  if (!state.timelineViewEndFrame || state.timelineViewEndFrame > totalFrames || state.timelineViewEndFrame === prevTotalFrames) {
     state.timelineViewEndFrame = totalFrames;
   }
+  prevTotalFrames = totalFrames;
+  state.timelineViewStartFrame = clamp(state.timelineViewStartFrame, 0, Math.max(totalFrames - 1, 0));
   state.timelineViewEndFrame = clamp(state.timelineViewEndFrame, state.timelineViewStartFrame + 1, totalFrames);
 }
 
@@ -1840,6 +1982,7 @@ function getWorkingFileData() {
       shakeEnabled: state.shakeEnabled,
       shakeIntensity: state.shakeIntensity,
       shakeSpeed: state.shakeSpeed,
+      shakeProfile: state.shakeProfile,
       smoothing: parseNumber(inputs.smooth.value, 0.35),
     },
     labels: state.labels.map((label) => ({
@@ -1868,12 +2011,19 @@ async function loadWorkingFile(file) {
     throw new Error("This is not a Camera Animation Tool working file.");
   }
 
-  state.duration = Math.max(parseNumber(json.duration, state.duration), 0.2);
-  inputs.duration.value = state.duration.toFixed(1);
-
+  state.fps = 24;
   const projectFrames = json.camera?.keyframes || [];
   state.keyframes = projectFrames.map((frame, index) => normalizeKeyframe(frame, index, projectFrames.length));
   state.keyframes.sort((a, b) => a.time - b.time);
+
+  const lastKeyframeTime = state.keyframes.at(-1)?.time || 0.2;
+  state.duration = Math.max(
+    parseNumber(json.duration, state.duration),
+    lastKeyframeTime,
+    state.modelAnimationDuration,
+    0.2
+  );
+  inputs.duration.value = state.duration.toFixed(1);
   state.selectedKeyframeIndex = clamp(parseNumber(json.camera?.selectedKeyframeIndex, 0), 0, state.keyframes.length - 1);
   state.copiedKeyframe = json.camera?.copiedKeyframe ? normalizeKeyframe(json.camera.copiedKeyframe, 0, 1) : null;
   if (json.camera?.defaultCamera) state.defaultCamera = normalizeKeyframe(json.camera.defaultCamera, 0, 1);
@@ -1891,12 +2041,15 @@ async function loadWorkingFile(file) {
   state.shakeEnabled = !!json.effects?.shakeEnabled;
   state.shakeIntensity = parseNumber(json.effects?.shakeIntensity, state.shakeIntensity);
   state.shakeSpeed = parseNumber(json.effects?.shakeSpeed, state.shakeSpeed);
+  state.shakeProfile = json.effects?.shakeProfile || "continuous";
   inputs.shakeEnabled.checked = state.shakeEnabled;
   inputs.shakeIntensity.disabled = !state.shakeEnabled;
   inputs.shakeSpeed.disabled = !state.shakeEnabled;
+  inputs.shakeProfile.disabled = !state.shakeEnabled;
   buttons.addShakeKeyframe.disabled = !state.shakeEnabled;
   inputs.shakeIntensity.value = state.shakeIntensity;
   inputs.shakeSpeed.value = state.shakeSpeed;
+  inputs.shakeProfile.value = state.shakeProfile;
   inputs.smooth.value = parseNumber(json.effects?.smoothing, parseNumber(inputs.smooth.value, 0.35));
 
   inputs.syncModelAnimation.checked = json.animation?.sync ?? inputs.syncModelAnimation.checked;
@@ -2477,6 +2630,7 @@ async function loadModel(file) {
   if (state.modelUrl) URL.revokeObjectURL(state.modelUrl);
   state.modelAnimations = [];
   state.modelAnimationDuration = 0;
+  state.fps = 24;
   state.modelUrl = URL.createObjectURL(file);
   modelViewer.src = state.modelUrl;
   modelViewer.removeAttribute("animation-name");
@@ -2484,6 +2638,43 @@ async function loadModel(file) {
   inputs.animation.disabled = true;
   modelAnimationStatus.textContent = "Loading model animations...";
   setStatus(`Loaded model: ${file.name}`);
+  requestAnimationFrame(() => fitModel());
+}
+
+function updateAnimationDuration() {
+  let attempts = 0;
+  const maxAttempts = 180; // Give larger GLBs time to expose animation clip durations.
+  const activeAnim = modelViewer.animationName || (state.modelAnimations.length ? state.modelAnimations[0] : "");
+
+  function check() {
+    const duration = getModelAnimationDuration();
+    if (duration > 0 || attempts >= maxAttempts) {
+      state.modelAnimationDuration = duration;
+      if (state.modelAnimationDuration > 0) {
+        state.duration = state.modelAnimationDuration;
+        inputs.duration.value = state.modelAnimationDuration.toFixed(1);
+        state.timelineViewStartFrame = 0;
+        state.timelineViewEndFrame = 0;
+        prevTotalFrames = 0;
+        ensureTimelineView();
+      }
+      modelViewer.currentTime = 0;
+      modelViewer.pause();
+      modelAnimationStatus.textContent = state.modelAnimationDuration
+        ? `Animation: ${activeAnim} - ${state.modelAnimationDuration.toFixed(2)}s - ${getTotalFrames()} frames`
+        : activeAnim ? `Animation: ${activeAnim} loaded` : "No animations";
+      setStatus(state.modelAnimationDuration
+        ? `Model animation ready: ${activeAnim} (${getTotalFrames()} frames).`
+        : activeAnim ? `Model animation selected: ${activeAnim}.` : "Model ready.");
+      renderTimelineMarkers();
+      seek(0);
+    } else {
+      attempts++;
+      requestAnimationFrame(check);
+    }
+  }
+
+  requestAnimationFrame(check);
 }
 
 function refreshModelAnimations() {
@@ -2505,23 +2696,7 @@ function refreshModelAnimations() {
   modelViewer.animationName = animations[0];
   inputs.animation.value = animations[0];
 
-  requestAnimationFrame(() => {
-    state.modelAnimationDuration = getModelAnimationDuration();
-    if (state.modelAnimationDuration > state.duration) {
-      state.duration = state.modelAnimationDuration;
-      inputs.duration.value = state.modelAnimationDuration.toFixed(1);
-    }
-    modelViewer.currentTime = 0;
-    modelViewer.pause();
-    modelAnimationStatus.textContent = state.modelAnimationDuration
-      ? `Animation: ${animations[0]} - ${state.modelAnimationDuration.toFixed(2)}s - ${getTotalFrames()} frames`
-      : `Animation: ${animations[0]} loaded`;
-    setStatus(state.modelAnimationDuration
-      ? `Model animation ready: ${animations[0]} (${getTotalFrames()} frames).`
-      : `Model animation selected: ${animations[0]}.`);
-    renderTimelineMarkers();
-    seek(0);
-  });
+  updateAnimationDuration();
 }
 
 async function loadAudio(file) {
@@ -2539,10 +2714,7 @@ async function loadCamera(file) {
   const rawFrames = extractCameraFrames(json);
   if (!rawFrames.length) throw new Error("Camera JSON did not include keyframes.");
   
-  const fps = json.fps ?? json.animationSettings?.fps;
-  if (fps !== undefined) {
-    state.fps = parseNumber(fps, 24);
-  }
+  state.fps = 24;
 
   if (json.shakeEnabled !== undefined || json.animationSettings?.shakeEnabled !== undefined) {
     state.shakeEnabled = !!(json.shakeEnabled ?? json.animationSettings?.shakeEnabled);
@@ -2844,51 +3016,66 @@ async function handleFile(file) {
 }
 
 function fitModel() {
-  try {
-    const orbit = modelViewer.getCameraOrbit();
-    if (orbit) {
-      const yawDeg = (orbit.theta * 180) / Math.PI;
-      const pitchDeg = (orbit.phi * 180) / Math.PI;
-      state.defaultCamera.orbit.yaw = yawDeg;
-      state.defaultCamera.orbit.pitch = pitchDeg;
-      state.defaultCamera.orbit.radius = orbit.radius;
-    }
-    const target = modelViewer.getCameraTarget();
-    if (target) {
-      state.defaultCamera.target = { x: target.x, y: target.y, z: target.z };
-    }
-  } catch (e) {
-    console.warn("Failed to read model-viewer default camera values on fitModel:", e);
-  }
+  modelViewer.removeAttribute("camera-orbit");
+  modelViewer.removeAttribute("camera-target");
+  modelViewer.removeAttribute("field-of-view");
 
-  const box = modelViewer.getBoundingClientRect();
-  const radius = Math.max(Math.min(box.width, box.height) / 160, 2.5);
-  state.defaultCamera.orbit.radius = state.defaultCamera.orbit.radius || radius;
-  
-  inputs.yaw.value = state.defaultCamera.orbit.yaw.toFixed(1);
-  inputs.pitch.value = state.defaultCamera.orbit.pitch.toFixed(1);
-  inputs.radius.value = state.defaultCamera.orbit.radius.toFixed(2);
-  inputs.targetX.value = state.defaultCamera.target.x.toFixed(2);
-  inputs.targetY.value = state.defaultCamera.target.y.toFixed(2);
-  inputs.targetZ.value = state.defaultCamera.target.z.toFixed(2);
+  requestAnimationFrame(async () => {
+    try {
+      if (modelViewer.updateComplete) await modelViewer.updateComplete;
+      if (typeof modelViewer.updateFraming === "function") modelViewer.updateFraming();
+      if (typeof modelViewer.jumpCameraToGoal === "function") modelViewer.jumpCameraToGoal();
 
-  seek(getTimelineTime());
+      const orbit = modelViewer.getCameraOrbit();
+      if (orbit) {
+        inputs.yaw.value = ((orbit.theta * 180) / Math.PI).toFixed(1);
+        inputs.pitch.value = ((orbit.phi * 180) / Math.PI).toFixed(1);
+        inputs.radius.value = orbit.radius.toFixed(2);
+        
+        state.defaultCamera.orbit = {
+          yaw: (orbit.theta * 180) / Math.PI,
+          pitch: (orbit.phi * 180) / Math.PI,
+          radius: orbit.radius
+        };
+      }
+
+      const target = modelViewer.getCameraTarget();
+      if (target) {
+        inputs.targetX.value = target.x.toFixed(2);
+        inputs.targetY.value = target.y.toFixed(2);
+        inputs.targetZ.value = target.z.toFixed(2);
+        
+        state.defaultCamera.target = { x: target.x, y: target.y, z: target.z };
+      }
+
+      const fov = modelViewer.getFieldOfView();
+      if (fov) {
+        const lens = fovToLens(fov);
+        inputs.lens.value = Math.round(lens);
+        if (lensReadout) lensReadout.textContent = `${Math.round(lens)}mm`;
+        if (fovReadout) fovReadout.textContent = `${fov.toFixed(1)}deg FOV`;
+        
+        state.defaultCamera.fov = fov;
+        state.defaultCamera.lens = lens;
+      }
+    } catch (e) {
+      console.warn("Failed to read camera values on fitModel:", e);
+    }
+
+    // Update displays
+    const frame = createCurrentKeyframe(getTimelineTime());
+    updateCurrentValuesDisplay(frame);
+    
+    setStatus("Fit model to screen.");
+  });
 }
 
 function resetCamera() {
   state.keyframes = [];
   state.duration = parseNumber(inputs.duration.value, 6);
   
-  // Apply default camera values to inputs and viewport
-  const defaultCam = {
-    time: 0,
-    orbit: { ...state.defaultCamera.orbit },
-    target: { ...state.defaultCamera.target },
-    fov: state.defaultCamera.fov,
-    lens: state.defaultCamera.lens,
-    shake: 0.3
-  };
-  applyCamera(defaultCam);
+  // Fit model to screen to establish optimal framing defaults
+  fitModel();
   
   renderKeyframes();
   renderTimelineMarkers();
@@ -2934,20 +3121,36 @@ inputs.startAudio.addEventListener("change", async () => {
 inputs.animation.addEventListener("change", () => {
   if (!inputs.animation.value) return;
   modelViewer.animationName = inputs.animation.value;
-  requestAnimationFrame(() => {
-    state.modelAnimationDuration = getModelAnimationDuration();
-    if (state.modelAnimationDuration > state.duration) {
-      state.duration = state.modelAnimationDuration;
-      inputs.duration.value = state.modelAnimationDuration.toFixed(1);
+  
+  let attempts = 0;
+  const maxAttempts = 30; // Up to 500ms
+  
+  function check() {
+    const duration = getModelAnimationDuration();
+    if (duration > 0 || attempts >= maxAttempts) {
+      state.modelAnimationDuration = duration;
+      if (state.modelAnimationDuration > 0) {
+        state.duration = state.modelAnimationDuration;
+        inputs.duration.value = state.modelAnimationDuration.toFixed(1);
+        state.timelineViewStartFrame = 0;
+        state.timelineViewEndFrame = 0;
+        prevTotalFrames = 0;
+        ensureTimelineView();
+      }
+      modelViewer.currentTime = getTimelineTime();
+      modelViewer.pause();
+      modelAnimationStatus.textContent = state.modelAnimationDuration
+        ? `Animation: ${inputs.animation.value} - ${state.modelAnimationDuration.toFixed(2)}s - ${getTotalFrames()} frames`
+        : `Animation: ${inputs.animation.value} selected`;
+      renderTimelineMarkers();
+      seek(getTimelineTime());
+    } else {
+      attempts++;
+      requestAnimationFrame(check);
     }
-    modelViewer.currentTime = getTimelineTime();
-    modelViewer.pause();
-    modelAnimationStatus.textContent = state.modelAnimationDuration
-      ? `Animation: ${inputs.animation.value} - ${state.modelAnimationDuration.toFixed(2)}s - ${getTotalFrames()} frames`
-      : `Animation: ${inputs.animation.value} selected`;
-    renderTimelineMarkers();
-    seek(getTimelineTime());
-  });
+  }
+  
+  requestAnimationFrame(check);
 });
 inputs.timeline.addEventListener("input", () => {
   state.pausedAt = getTimeFromTimelineValue(inputs.timeline.value);
@@ -2970,7 +3173,14 @@ inputs.bottomTimeline.addEventListener("dblclick", () => {
   setStatus("Timeline zoom reset.");
 });
 inputs.duration.addEventListener("change", () => {
-  state.duration = Math.max(parseNumber(inputs.duration.value, 6), 0.2);
+  const lastKeyframeTime = state.keyframes.at(-1)?.time || 0.2;
+  state.duration = Math.max(
+    parseNumber(inputs.duration.value, 6),
+    lastKeyframeTime,
+    state.modelAnimationDuration,
+    0.2
+  );
+  inputs.duration.value = state.duration.toFixed(1);
   renderTimelineMarkers();
   seek(getTimelineTime());
 });
@@ -3049,9 +3259,15 @@ inputs.shakeEnabled.addEventListener("change", () => {
   state.shakeEnabled = inputs.shakeEnabled.checked;
   inputs.shakeIntensity.disabled = !state.shakeEnabled;
   inputs.shakeSpeed.disabled = !state.shakeEnabled;
+  inputs.shakeProfile.disabled = !state.shakeEnabled;
   buttons.addShakeKeyframe.disabled = !state.shakeEnabled;
   seek(getTimelineTime());
   setStatus(state.shakeEnabled ? "Handheld camera shake enabled." : "Handheld camera shake disabled.");
+});
+
+inputs.shakeProfile.addEventListener("change", () => {
+  state.shakeProfile = inputs.shakeProfile.value;
+  seek(getTimelineTime());
 });
 
 const shakeIntensityReadout = document.querySelector("#shakeIntensityReadout");
@@ -3252,6 +3468,9 @@ window.addEventListener("keydown", (event) => {
     } else if (event.code === "KeyA") {
       event.preventDefault();
       toggleAutoKey();
+    } else if (event.code === "KeyF") {
+      event.preventDefault();
+      fitModel();
     } else if (event.ctrlKey && event.code === "KeyI") {
       event.preventDefault();
       openCursorImportMenu();
@@ -3362,36 +3581,7 @@ document.querySelectorAll(".ai-chip").forEach((chip) => {
   });
 });
 
-// Viewport clicks to jump to 3D camera path keyframes
-if (modelViewer) {
-  const raycaster = typeof THREE !== 'undefined' ? new THREE.Raycaster() : null;
-  const mouse = typeof THREE !== 'undefined' ? new THREE.Vector2() : null;
 
-  modelViewer.addEventListener("click", (event) => {
-    if (!raycaster || !mouse || state.isPlaying || !pathPoints.length) return;
-
-    const rect = modelViewer.getBoundingClientRect();
-    mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
-    mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
-
-    const symbol = Symbol.for('three3d');
-    const three = modelViewer[symbol];
-    if (!three || !three.camera) return;
-
-    raycaster.setFromCamera(mouse, three.camera);
-    const intersects = raycaster.intersectObjects(pathPoints);
-
-    if (intersects.length > 0) {
-      event.preventDefault();
-      event.stopPropagation();
-      const clickedMesh = intersects[0].object;
-      const index = clickedMesh.userData.keyframeIndex;
-      if (index !== undefined) {
-        seekToKeyframe(index);
-      }
-    }
-  });
-}
 
 if (timelinePanel) {
   timelinePanel.addEventListener("pointerenter", () => {
